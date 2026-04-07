@@ -91,7 +91,7 @@ The dashboard's `/api/apply` endpoint calls `worker_loop()` directly in-process 
 
 Currently in `~/.applypilot/.env`:
 ```
-GEMINI_API_KEY=AIzaSyCLOhT2ipB_h4IEk5LSxLHaLTJVR5oPEzE
+GEMINI_API_KEY=<your-key-in-~/.applypilot/.env>
 LLM_MODEL=gemini-2.5-flash
 ```
 

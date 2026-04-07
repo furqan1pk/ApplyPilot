@@ -256,6 +256,202 @@ def apply(
     )
 
 
+@app.command(name="apply-url")
+def apply_url(
+    url: str = typer.Argument(..., help="Job URL to apply to (Greenhouse, Lever, etc)."),
+    enrich: bool = typer.Option(False, "--enrich", "-e", help="Scrape job page and score before applying."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model name."),
+    headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
+) -> None:
+    """Apply to a specific job URL — even if it's not in the database yet.
+
+    Inserts the URL into the DB (if needed), optionally enriches & scores,
+    then launches auto-apply.
+
+    Examples:
+        applypilot apply-url https://boards.greenhouse.io/company/jobs/123 --dry-run
+        applypilot apply-url https://jobs.lever.co/company/abc --enrich --dry-run
+        applypilot apply-url https://some-job-url.com --enrich --model sonnet
+    """
+    _bootstrap()
+
+    from applypilot.config import check_tier, RESUME_PDF_PATH
+    from applypilot.database import get_connection
+
+    # Tier 3 required for apply
+    check_tier(3, "auto-apply")
+
+    if not url.startswith("http"):
+        console.print("[red]URL must start with http:// or https://[/red]")
+        raise typer.Exit(code=1)
+
+    conn = get_connection()
+
+    # Ensure job exists in DB
+    row = conn.execute("SELECT url, tailored_resume_path, fit_score FROM jobs WHERE url = ?", (url,)).fetchone()
+    resume_path = str(RESUME_PDF_PATH) if RESUME_PDF_PATH.exists() else None
+
+    if row:
+        console.print(f"[green]Job already in DB[/green] (score: {row['fit_score'] or 'unscored'})")
+        if not row["tailored_resume_path"] and resume_path:
+            conn.execute("UPDATE jobs SET tailored_resume_path = ? WHERE url = ?", (resume_path, url))
+            conn.commit()
+    else:
+        from urllib.parse import urlparse
+        domain = urlparse(url).hostname or "unknown"
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        conn.execute("""
+            INSERT OR IGNORE INTO jobs (url, title, site, discovered_at, tailored_resume_path)
+            VALUES (?, ?, ?, ?, ?)
+        """, (url, f"Quick Apply ({domain})", domain, now, resume_path))
+        conn.commit()
+        console.print(f"[blue]New job inserted into DB[/blue]")
+
+    # Optionally enrich & score
+    if enrich:
+        console.print("[yellow]Enriching (scraping + scoring)...[/yellow]")
+        try:
+            from applypilot.server import _enrich_single_job
+            _enrich_single_job(conn, url)
+            updated = conn.execute("SELECT fit_score, title FROM jobs WHERE url = ?", (url,)).fetchone()
+            if updated and updated["fit_score"]:
+                console.print(f"[green]Enriched![/green] Score: {updated['fit_score']}, Title: {updated['title']}")
+            else:
+                console.print("[yellow]Enrichment completed (score may not be available)[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]Enrichment warning:[/yellow] {e}")
+            console.print("[dim]Continuing with apply anyway...[/dim]")
+
+    # Launch apply
+    from applypilot.apply.launcher import main as apply_main
+
+    console.print(f"\n[bold blue]Launching Apply[/bold blue]")
+    console.print(f"  URL:      {url[:80]}...")
+    console.print(f"  Model:    {model}")
+    console.print(f"  Dry run:  {dry_run}")
+    console.print(f"  Enrich:   {enrich}")
+    console.print()
+
+    apply_main(
+        limit=1,
+        target_url=url,
+        min_score=1,  # bypass score filter — user explicitly chose this
+        headless=headless,
+        model=model,
+        dry_run=dry_run,
+        continuous=False,
+        workers=1,
+    )
+
+
+@app.command(name="apply-bulk")
+def apply_bulk(
+    file: Optional[str] = typer.Option(None, "--file", "-f", help="Path to CSV/TXT file with URLs (one per line)."),
+    enrich: bool = typer.Option(False, "--enrich", "-e", help="Scrape and score each job before applying."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model name."),
+    headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
+) -> None:
+    """Apply to multiple job URLs from a file.
+
+    Reads URLs from a CSV or text file (one URL per line), inserts into DB,
+    and applies to each sequentially.
+
+    Examples:
+        applypilot apply-bulk --file urls.txt --dry-run
+        applypilot apply-bulk --file jobs.csv --enrich --model sonnet
+    """
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    import re
+
+    check_tier(3, "auto-apply")
+
+    if not file:
+        console.print("[red]--file is required. Provide a CSV or text file with URLs.[/red]")
+        raise typer.Exit(code=1)
+
+    from pathlib import Path
+    file_path = Path(file)
+    if not file_path.exists():
+        console.print(f"[red]File not found:[/red] {file}")
+        raise typer.Exit(code=1)
+
+    # Extract URLs from file
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+    urls = re.findall(r'https?://[^\s,\"\'<>]+', text)
+    urls = list(dict.fromkeys(urls))  # deduplicate preserving order
+
+    if not urls:
+        console.print("[red]No URLs found in file.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold]Found {len(urls)} URLs[/bold]\n")
+    for i, u in enumerate(urls[:10], 1):
+        console.print(f"  {i}. {u[:80]}")
+    if len(urls) > 10:
+        console.print(f"  ... and {len(urls) - 10} more")
+    console.print()
+
+    # Process each URL
+    from applypilot.apply.launcher import main as apply_main
+    from applypilot.database import get_connection
+    from applypilot.config import RESUME_PDF_PATH
+    from urllib.parse import urlparse
+    from datetime import datetime
+
+    conn = get_connection()
+    resume_path = str(RESUME_PDF_PATH) if RESUME_PDF_PATH.exists() else None
+
+    for i, url in enumerate(urls, 1):
+        console.print(f"\n[bold]── Job {i}/{len(urls)} ──[/bold]")
+        console.print(f"  URL: {url[:80]}")
+
+        # Ensure in DB
+        row = conn.execute("SELECT url FROM jobs WHERE url = ?", (url,)).fetchone()
+        if not row:
+            domain = urlparse(url).hostname or "unknown"
+            conn.execute("""
+                INSERT OR IGNORE INTO jobs (url, title, site, discovered_at, tailored_resume_path)
+                VALUES (?, ?, ?, ?, ?)
+            """, (url, f"Quick Apply ({domain})", domain, datetime.now().isoformat(), resume_path))
+            conn.commit()
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path = COALESCE(tailored_resume_path, ?) WHERE url = ?",
+                (resume_path, url),
+            )
+            conn.commit()
+
+        if enrich:
+            console.print("  [yellow]Enriching...[/yellow]")
+            try:
+                from applypilot.server import _enrich_single_job
+                _enrich_single_job(conn, url)
+            except Exception as e:
+                console.print(f"  [yellow]Enrich warning:[/yellow] {e}")
+
+        console.print(f"  [blue]Applying ({'dry run' if dry_run else 'LIVE'})...[/blue]")
+        try:
+            apply_main(
+                limit=1,
+                target_url=url,
+                min_score=1,
+                headless=headless,
+                model=model,
+                dry_run=dry_run,
+                continuous=False,
+                workers=1,
+            )
+        except Exception as e:
+            console.print(f"  [red]Error:[/red] {e}")
+
+    console.print(f"\n[bold green]Done! Processed {len(urls)} URLs.[/bold green]")
+
+
 @app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""

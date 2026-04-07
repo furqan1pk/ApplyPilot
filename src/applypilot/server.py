@@ -23,8 +23,9 @@ from pathlib import Path
 from fastapi import FastAPI, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from applypilot.config import APP_DIR, SCREENSHOT_DIR, LOG_DIR
+from applypilot.config import APP_DIR, SCREENSHOT_DIR, LOG_DIR, RESUME_PDF_PATH
 from applypilot.database import get_connection
+from urllib.parse import urlparse
 
 app = FastAPI(title="ApplyPilot Dashboard")
 
@@ -169,6 +170,268 @@ def _run_apply(url: str, dry_run: bool, model: str):
 def api_active():
     with _lock:
         return dict(_active_applies)
+
+
+# ── Quick Apply by URL ─────────────────────────────────────────────────────
+
+def _guess_site(url: str) -> str:
+    """Guess the ATS/site name from URL domain."""
+    domain = urlparse(url).hostname or ""
+    if "greenhouse" in domain or "boards.greenhouse" in domain:
+        return "greenhouse"
+    if "lever" in domain or "jobs.lever" in domain:
+        return "lever"
+    if "workday" in domain or "myworkday" in domain:
+        return "workday"
+    if "linkedin" in domain:
+        return "linkedin"
+    if "ashbyhq" in domain:
+        return "ashby"
+    if "icims" in domain:
+        return "icims"
+    return domain.split(".")[-2] if "." in domain else "unknown"
+
+
+def _ensure_job_in_db(url: str, enrich: bool = False) -> dict:
+    """Make sure a URL exists in the jobs table so acquire_job() can find it.
+
+    If the job already exists, just ensures tailored_resume_path is set.
+    If not, inserts a minimal row. Optionally runs enrichment + scoring.
+
+    Returns: {"status": "existing"|"inserted"|"enriched", "url": str}
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT url, tailored_resume_path, fit_score FROM jobs WHERE url = ?", (url,)).fetchone()
+
+    resume_path = str(RESUME_PDF_PATH) if RESUME_PDF_PATH.exists() else None
+
+    if row:
+        # Job exists — just make sure resume path is set
+        if not row["tailored_resume_path"] and resume_path:
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path = ? WHERE url = ?",
+                (resume_path, url),
+            )
+            conn.commit()
+        return {"status": "existing", "url": url, "score": row["fit_score"]}
+
+    # Insert new job
+    site = _guess_site(url)
+    now = datetime.now().isoformat()
+    conn.execute("""
+        INSERT OR IGNORE INTO jobs (url, title, site, discovered_at, tailored_resume_path)
+        VALUES (?, ?, ?, ?, ?)
+    """, (url, f"Quick Apply ({site})", site, now, resume_path))
+    conn.commit()
+
+    result = {"status": "inserted", "url": url, "score": None}
+
+    if enrich:
+        try:
+            _enrich_single_job(conn, url)
+            result["status"] = "enriched"
+            # Re-read score after enrichment
+            updated = conn.execute("SELECT fit_score, title FROM jobs WHERE url = ?", (url,)).fetchone()
+            if updated:
+                result["score"] = updated["fit_score"]
+                if updated["title"]:
+                    result["title"] = updated["title"]
+        except Exception as e:
+            result["enrich_error"] = str(e)[:200]
+
+    return result
+
+
+def _enrich_single_job(conn, url: str):
+    """Run enrichment (scrape + score) for a single URL."""
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    try:
+        # Step 1: Scrape the job page for description + apply URL
+        from playwright.sync_api import sync_playwright
+        from applypilot.enrichment.detail import scrape_detail_page
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            detail = scrape_detail_page(page, url)
+            browser.close()
+
+        if detail.get("full_description"):
+            conn.execute("""
+                UPDATE jobs SET
+                    full_description = ?,
+                    application_url = ?,
+                    detail_scraped_at = ?
+                WHERE url = ?
+            """, (
+                detail["full_description"],
+                detail.get("application_url"),
+                datetime.now().isoformat(),
+                url,
+            ))
+            # Update title from description if we got something better
+            if detail.get("full_description"):
+                # Try to extract a better title from the page
+                lines = detail["full_description"].strip().split("\n")
+                if lines and len(lines[0]) < 120:
+                    conn.execute(
+                        "UPDATE jobs SET title = ? WHERE url = ? AND title LIKE 'Quick Apply%'",
+                        (lines[0].strip("# ").strip(), url),
+                    )
+            conn.commit()
+
+        # Step 2: Score the job if we got a description
+        if detail.get("full_description"):
+            from applypilot.config import RESUME_PATH
+            from applypilot.scoring.scorer import score_job
+
+            resume_text = ""
+            if RESUME_PATH.exists():
+                resume_text = RESUME_PATH.read_text(encoding="utf-8", errors="replace")
+
+            if resume_text:
+                job_dict = dict(conn.execute(
+                    "SELECT url, title, description, full_description, location, salary FROM jobs WHERE url = ?",
+                    (url,),
+                ).fetchone())
+                score_result = score_job(resume_text, job_dict)
+                conn.execute("""
+                    UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?
+                    WHERE url = ?
+                """, (
+                    score_result.get("score", 0),
+                    score_result.get("reasoning", ""),
+                    datetime.now().isoformat(),
+                    url,
+                ))
+                conn.commit()
+
+    except ImportError as e:
+        _logger.warning("Enrichment dependencies not available: %s", e)
+    except Exception as e:
+        _logger.exception("Enrichment failed for %s: %s", url[:60], e)
+
+
+@app.post("/api/apply-url")
+def api_apply_url(body: dict, background_tasks: BackgroundTasks):
+    """Apply to a single URL — inserts into DB if needed, then applies.
+
+    Body: {url, enrich?: bool, dry_run?: bool, model?: str}
+    """
+    url = body.get("url", "").strip()
+    enrich = body.get("enrich", False)
+    dry_run = body.get("dry_run", True)
+    model = body.get("model", "sonnet")
+
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+    if not url.startswith("http"):
+        return JSONResponse({"error": "url must start with http:// or https://"}, status_code=400)
+
+    with _lock:
+        if url in _active_applies:
+            return JSONResponse({"error": "already applying to this URL"}, status_code=409)
+
+    # Ensure the job is in the DB (sync — fast for existing jobs, ~30s with enrich)
+    db_result = _ensure_job_in_db(url, enrich=enrich)
+
+    # Now trigger apply in background
+    with _lock:
+        _active_applies[url] = {
+            "started": datetime.now().isoformat(),
+            "dry_run": dry_run,
+            "source": "quick-apply",
+        }
+
+    background_tasks.add_task(_run_apply, url, dry_run, model)
+    return {
+        "status": "started",
+        "url": url,
+        "dry_run": dry_run,
+        "model": model,
+        "db": db_result,
+    }
+
+
+@app.post("/api/apply-bulk")
+def api_apply_bulk(body: dict, background_tasks: BackgroundTasks):
+    """Apply to multiple URLs in sequence.
+
+    Body: {urls: [str], enrich?: bool, dry_run?: bool, model?: str}
+    """
+    urls = body.get("urls", [])
+    enrich = body.get("enrich", False)
+    dry_run = body.get("dry_run", True)
+    model = body.get("model", "sonnet")
+
+    if not urls:
+        return JSONResponse({"error": "urls list required"}, status_code=400)
+
+    # Deduplicate and validate
+    clean_urls = []
+    for u in urls:
+        u = u.strip()
+        if u and u.startswith("http") and u not in clean_urls:
+            clean_urls.append(u)
+
+    if not clean_urls:
+        return JSONResponse({"error": "no valid URLs found"}, status_code=400)
+
+    # Ensure all jobs are in the DB first (sync)
+    db_results = []
+    for u in clean_urls:
+        db_results.append(_ensure_job_in_db(u, enrich=enrich))
+
+    # Queue them for sequential apply in background
+    background_tasks.add_task(_run_bulk_apply, clean_urls, dry_run, model)
+
+    return {
+        "status": "queued",
+        "count": len(clean_urls),
+        "dry_run": dry_run,
+        "model": model,
+        "jobs": db_results,
+    }
+
+
+def _run_bulk_apply(urls: list[str], dry_run: bool, model: str):
+    """Apply to a list of URLs sequentially."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for url in urls:
+        with _lock:
+            if url in _active_applies:
+                continue  # skip if already running
+            _active_applies[url] = {
+                "started": datetime.now().isoformat(),
+                "dry_run": dry_run,
+                "source": "bulk-apply",
+            }
+
+        try:
+            from applypilot.config import ensure_dirs, load_env
+            load_env()
+            ensure_dirs()
+
+            from applypilot.apply.launcher import worker_loop
+            applied, failed = worker_loop(
+                worker_id=0,
+                limit=1,
+                target_url=url,
+                min_score=1,
+                headless=False,
+                model=model,
+                dry_run=dry_run,
+            )
+            logger.info("Bulk apply %s: applied=%d failed=%d", url[:60], applied, failed)
+        except Exception as e:
+            logger.exception("Bulk apply error for %s: %s", url[:60], e)
+        finally:
+            with _lock:
+                _active_applies.pop(url, None)
 
 
 # ── Review Page (per-job detail with screenshots + log) ───────────────
@@ -364,6 +627,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <!-- Stats -->
   <div id="stats" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"></div>
+
+  <!-- Quick Apply Section -->
+  <div class="bg-slate-800 rounded-xl p-4 mb-6">
+    <div class="flex items-center gap-2 mb-3">
+      <h2 class="text-sm font-bold text-slate-300">Quick Apply</h2>
+      <button onclick="document.getElementById('bulk-modal').classList.remove('hidden')"
+              class="text-xs px-2 py-1 rounded bg-slate-700 text-slate-400 hover:bg-slate-600 ml-auto">Bulk Apply</button>
+    </div>
+    <div class="flex flex-wrap gap-2 items-center">
+      <input id="quick-url" type="text" placeholder="Paste a job URL (Greenhouse, Lever, etc.)"
+             class="flex-1 min-w-[300px] bg-slate-700 border border-slate-600 text-slate-200 px-3 py-2 rounded text-sm">
+      <label class="flex items-center gap-1 text-xs text-slate-400 cursor-pointer select-none">
+        <input id="quick-enrich" type="checkbox" class="accent-blue-500"> Enrich &amp; Score
+      </label>
+      <button onclick="quickApply(true)" class="text-xs px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-semibold">Dry Run</button>
+      <button onclick="quickApply(false)" class="text-xs px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">Apply</button>
+    </div>
+    <p id="quick-status" class="text-xs text-slate-500 mt-2 hidden"></p>
+  </div>
+
+  <!-- Bulk Apply Modal -->
+  <div id="bulk-modal" class="fixed inset-0 bg-black/80 z-40 hidden overflow-y-auto">
+    <div class="max-w-2xl mx-auto my-12 bg-slate-800 rounded-xl p-6 relative">
+      <button onclick="document.getElementById('bulk-modal').classList.add('hidden')" class="absolute top-4 right-4 text-slate-400 hover:text-white text-xl">&times;</button>
+      <h2 class="text-lg font-bold mb-4 text-slate-200">Bulk Apply</h2>
+      <p class="text-sm text-slate-400 mb-3">Paste URLs (one per line) or upload a CSV file with a column of URLs.</p>
+      <textarea id="bulk-urls" rows="8" placeholder="https://boards.greenhouse.io/company/jobs/123&#10;https://jobs.lever.co/company/abc-def&#10;..."
+                class="w-full bg-slate-700 border border-slate-600 text-slate-200 px-3 py-2 rounded text-sm mb-3 font-mono"></textarea>
+      <div class="flex items-center gap-3 mb-4">
+        <label class="text-xs text-slate-400 cursor-pointer bg-slate-700 px-3 py-2 rounded hover:bg-slate-600">
+          Upload CSV <input id="bulk-csv" type="file" accept=".csv,.xlsx,.txt" class="hidden" onchange="loadCSV(this)">
+        </label>
+        <span id="csv-status" class="text-xs text-slate-500"></span>
+        <label class="flex items-center gap-1 text-xs text-slate-400 cursor-pointer select-none ml-auto">
+          <input id="bulk-enrich" type="checkbox" class="accent-blue-500"> Enrich &amp; Score
+        </label>
+      </div>
+      <div class="flex gap-2">
+        <button onclick="bulkApply(true)" class="text-xs px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-semibold">Dry Run All</button>
+        <button onclick="bulkApply(false)" class="text-xs px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">Apply All</button>
+      </div>
+      <p id="bulk-status" class="text-xs text-slate-500 mt-3 hidden"></p>
+    </div>
+  </div>
 
   <!-- Filters -->
   <div class="bg-slate-800 rounded-xl p-3 mb-6 flex flex-wrap gap-2 items-center">
@@ -598,7 +905,126 @@ function closeDetail() {
 }
 
 // Close modal on Escape
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeDetail(); document.getElementById('overlay').classList.remove('active'); }});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeDetail();
+    document.getElementById('overlay').classList.remove('active');
+    document.getElementById('bulk-modal').classList.add('hidden');
+  }
+});
+
+// ── Quick Apply ──────────────────────────────────────────────
+
+async function quickApply(dryRun) {
+  const url = document.getElementById('quick-url').value.trim();
+  if (!url) { alert('Please paste a job URL first.'); return; }
+  if (!url.startsWith('http')) { alert('URL must start with http:// or https://'); return; }
+  if (!dryRun && !confirm('Submit application for real? (not a dry run)')) return;
+
+  const enrich = document.getElementById('quick-enrich').checked;
+  const statusEl = document.getElementById('quick-status');
+  statusEl.classList.remove('hidden');
+  statusEl.textContent = enrich ? 'Enriching & queuing apply...' : 'Queuing apply...';
+  statusEl.className = 'text-xs text-yellow-400 mt-2';
+
+  try {
+    const res = await fetch('/api/apply-url', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, enrich, dry_run: dryRun, model: 'sonnet'})
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      statusEl.className = 'text-xs text-red-400 mt-2';
+      return;
+    }
+    const dbInfo = data.db || {};
+    let msg = dryRun ? 'Dry run started' : 'Apply started';
+    if (dbInfo.status === 'existing') msg += ' (job was already in DB)';
+    else if (dbInfo.status === 'enriched') msg += ` (enriched, score: ${dbInfo.score || '?'})`;
+    else if (dbInfo.status === 'inserted') msg += ' (new job added to DB)';
+    statusEl.textContent = msg;
+    statusEl.className = 'text-xs text-emerald-400 mt-2';
+
+    // Refresh job list & poll for completion
+    await loadData();
+    pollApply(url);
+  } catch (e) {
+    statusEl.textContent = 'Network error: ' + e.message;
+    statusEl.className = 'text-xs text-red-400 mt-2';
+  }
+}
+
+// Allow Enter key in the URL input
+document.getElementById('quick-url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') quickApply(true);
+});
+
+// ── Bulk Apply ───────────────────────────────────────────────
+
+function loadCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const statusEl = document.getElementById('csv-status');
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const text = e.target.result;
+    // Extract URLs from CSV — find anything that looks like a URL
+    const urlRegex = /https?:\\/\\/[^\\s,\"'<>]+/g;
+    const urls = [...new Set(text.match(urlRegex) || [])];
+    if (urls.length === 0) {
+      statusEl.textContent = 'No URLs found in file.';
+      return;
+    }
+    document.getElementById('bulk-urls').value = urls.join('\\n');
+    statusEl.textContent = `Loaded ${urls.length} URLs from ${file.name}`;
+  };
+  reader.readAsText(file);
+}
+
+async function bulkApply(dryRun) {
+  const text = document.getElementById('bulk-urls').value.trim();
+  if (!text) { alert('Please paste some URLs or upload a CSV.'); return; }
+
+  const urls = text.split(/[\\n\\r]+/).map(u => u.trim()).filter(u => u.startsWith('http'));
+  if (urls.length === 0) { alert('No valid URLs found.'); return; }
+  if (!dryRun && !confirm(`Submit ${urls.length} real applications? (not dry runs)`)) return;
+
+  const enrich = document.getElementById('bulk-enrich').checked;
+  const statusEl = document.getElementById('bulk-status');
+  statusEl.classList.remove('hidden');
+  statusEl.textContent = `Processing ${urls.length} URLs...`;
+  statusEl.className = 'text-xs text-yellow-400 mt-3';
+
+  try {
+    const res = await fetch('/api/apply-bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({urls, enrich, dry_run: dryRun, model: 'sonnet'})
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      statusEl.className = 'text-xs text-red-400 mt-3';
+      return;
+    }
+    statusEl.textContent = `Queued ${data.count} jobs for ${dryRun ? 'dry run' : 'apply'}. They will run sequentially.`;
+    statusEl.className = 'text-xs text-emerald-400 mt-3';
+
+    // Close modal after short delay & refresh
+    setTimeout(() => {
+      document.getElementById('bulk-modal').classList.add('hidden');
+      loadData();
+    }, 2000);
+
+    // Poll for all
+    urls.forEach(u => pollApply(u));
+  } catch (e) {
+    statusEl.textContent = 'Network error: ' + e.message;
+    statusEl.className = 'text-xs text-red-400 mt-3';
+  }
+}
 
 // Initial load + auto-refresh every 30s
 loadData();
