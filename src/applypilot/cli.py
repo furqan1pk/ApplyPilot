@@ -333,6 +333,22 @@ def dashboard() -> None:
 
 
 @app.command()
+def serve(
+    port: int = typer.Option(8899, help="Port to serve dashboard on."),
+    host: str = typer.Option("127.0.0.1", help="Host to bind to."),
+) -> None:
+    """Launch the live dashboard with auto-apply buttons."""
+    _bootstrap()
+
+    import uvicorn
+    from applypilot.server import app as web_app
+
+    console.print(f"[green]Dashboard running at http://{host}:{port}[/green]")
+    console.print("[dim]Press Ctrl+C to stop.[/dim]")
+    uvicorn.run(web_app, host=host, port=port, log_level="warning")
+
+
+@app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil

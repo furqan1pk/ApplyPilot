@@ -111,50 +111,29 @@ def setup_worker_profile(worker_id: int) -> Path:
         Path to the worker's Chrome user-data directory.
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+
+    # Always remove singleton locks to prevent Chrome from refusing to start
+    for lock_file in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        (profile_dir / lock_file).unlink(missing_ok=True)
+
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
-    source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
-    if source is None:
-        source = config.get_chrome_user_data()
+    # Create a minimal fresh profile (don't clone from user's active Chrome
+    # which causes Chrome to join the existing session instead of starting
+    # a new debug instance)
+    logger.info("[worker-%d] Creating fresh Chrome profile...", worker_id)
+    default_dir = profile_dir / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
+    # Write minimal Preferences to skip first-run dialogs
+    import json
+    prefs = {
+        "profile": {"exit_type": "Normal", "exited_cleanly": True},
+        "browser": {"has_seen_welcome_page": True, "check_default_browser": False},
+        "session": {"restore_on_startup": 4, "startup_urls": []},
     }
-
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+    (default_dir / "Preferences").write_text(json.dumps(prefs), encoding="utf-8")
 
     return profile_dir
 
@@ -218,9 +197,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-search-engine-choice-screen",
+        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding,ProfilePicker",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
         "--password-store=basic",

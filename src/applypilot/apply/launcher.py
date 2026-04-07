@@ -6,11 +6,14 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import glob
+import hashlib
 import json
 import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -111,7 +114,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -322,8 +325,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     # Build claude command
+    claude_bin = shutil.which("claude") or "claude"
     cmd = [
-        "claude",
+        claude_bin,
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
@@ -346,6 +350,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # env.pop("ANTHROPIC_API_KEY", None)  # Disabled — subscription mode doesn't work for subprocess calls
 
     worker_dir = reset_worker_dir(worker_id)
 
@@ -456,6 +461,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
+        # Capture final screenshot via CDP while Chrome is still alive
+        try:
+            _capture_cdp_screenshot(port, job.get("url", ""), worker_id)
+        except Exception as e:
+            logger.debug("CDP screenshot failed (non-critical): %s", e)
+
         if stats:
             cost = stats.get("cost_usd", 0)
             ws = get_state(worker_id)
@@ -518,6 +529,117 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 # Permanent failure classification
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Persist screenshots & logs per job
+# ---------------------------------------------------------------------------
+
+def _url_hash(url: str) -> str:
+    """12-char hex hash of a URL for directory naming."""
+    return hashlib.sha256(url.encode()).hexdigest()[:12]
+
+
+def _capture_cdp_screenshot(port: int, job_url: str, worker_id: int):
+    """Capture screenshots of all Chrome tabs via CDP before cleanup."""
+    import httpx
+
+    url_hash = _url_hash(job_url)
+    dest = config.SCREENSHOT_DIR / url_hash
+    dest.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Get list of tabs
+        resp = httpx.get(f"http://localhost:{port}/json", timeout=5)
+        tabs = resp.json()
+
+        for i, tab in enumerate(tabs):
+            if tab.get("type") != "page":
+                continue
+            ws_url = tab.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+
+            # Use CDP Page.captureScreenshot via HTTP endpoint
+            tab_id = tab["id"]
+            shot_resp = httpx.post(
+                f"http://localhost:{port}/json/protocol",
+                timeout=10,
+            )
+            # Simpler approach: use the /screenshot endpoint if available
+            # Fall back to saving via websocket
+            pass
+
+        # Simplest approach: use httpx to call CDP screenshot on each tab
+        for i, tab in enumerate(tabs):
+            if tab.get("type") != "page" or "chrome://" in tab.get("url", ""):
+                continue
+            try:
+                import websockets
+                import asyncio
+
+                async def _take_screenshot(ws_url, dest_path):
+                    import websockets as ws_lib
+                    async with ws_lib.connect(ws_url) as ws:
+                        await ws.send(json.dumps({"id": 1, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+                        result = json.loads(await ws.recv())
+                        if "result" in result and "data" in result["result"]:
+                            import base64 as b64
+                            png_data = b64.b64decode(result["result"]["data"])
+                            dest_path.write_bytes(png_data)
+
+                ws_url = tab["webSocketDebuggerUrl"]
+                dest_path = dest / f"screenshot_{i:02d}_{tab.get('title', 'page')[:30].replace(' ', '_')}.png"
+                asyncio.run(_take_screenshot(ws_url, dest_path))
+                logger.info("Captured CDP screenshot: %s", dest_path.name)
+            except Exception as e:
+                logger.debug("CDP screenshot for tab %d failed: %s", i, e)
+
+    except Exception as e:
+        logger.debug("CDP screenshot capture failed: %s", e)
+
+
+def save_job_artifacts(job_url: str, worker_id: int, result: str):
+    """Copy screenshots and logs from worker dir to persistent per-job dir."""
+    from applypilot.config import SCREENSHOT_DIR, APPLY_WORKER_DIR, LOG_DIR
+
+    url_hash = _url_hash(job_url)
+    dest = SCREENSHOT_DIR / url_hash
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Copy all PNGs from worker dir and ALL subdirs (including .playwright-mcp/)
+    worker_dir = APPLY_WORKER_DIR / f"worker-{worker_id}"
+    png_count = 0
+    for png in worker_dir.rglob("*.png"):
+        # Skip Chrome internal PNGs (extensions, avatars, etc.)
+        rel = str(png.relative_to(worker_dir))
+        if "Extensions" in rel or "Avatars" in rel or "Default" in rel:
+            continue
+        shutil.copy2(png, dest / png.name)
+        png_count += 1
+
+    # Also check the chrome worker dir for Playwright screenshots
+    chrome_worker = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    mcp_dir = chrome_worker / ".playwright-mcp"
+    if mcp_dir.exists():
+        for png in mcp_dir.glob("*.png"):
+            shutil.copy2(png, dest / png.name)
+            png_count += 1
+
+    logger.info("Copied %d screenshots for %s", png_count, job_url[:60])
+
+    # Copy the most recent Claude log for this job
+    log_files = sorted(LOG_DIR.glob(f"claude_*_w{worker_id}_*.txt"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    if log_files:
+        shutil.copy2(log_files[0], dest / "log.txt")
+
+    # Write a metadata file
+    meta = {"url": job_url, "result": result, "saved_at": datetime.now().isoformat()}
+    (dest / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    logger.info("Saved artifacts for %s to %s (%d files)",
+                job_url[:60], dest, len(list(dest.iterdir())))
+
 
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
@@ -613,6 +735,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+                try:
+                    save_job_artifacts(job["url"], worker_id, result)
+                except Exception as e:
+                    logger.warning("Failed to save artifacts: %s", e)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
@@ -621,6 +747,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+                try:
+                    save_job_artifacts(job["url"], worker_id, result)
+                except Exception as e:
+                    logger.warning("Failed to save artifacts: %s", e)
 
         except KeyboardInterrupt:
             release_lock(job["url"])
